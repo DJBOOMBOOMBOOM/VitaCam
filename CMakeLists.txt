@@ -27,6 +27,7 @@ add_executable(${PROJECT_NAME}
 )
 
 target_link_libraries(${PROJECT_NAME}
+  SceAudioIn_stub
   SceCamera_stub
   SceNet_stub
   SceNetCtl_stub
