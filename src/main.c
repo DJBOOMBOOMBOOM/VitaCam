@@ -634,7 +634,7 @@ int main(void) {
     g_actual_port = 80;
   }
 
-  sceNetListen(server, 1);
+  sceNetListen(server, 4);
 
   // Inicia thread mDNS
   SceUID mdns_thid = sceKernelCreateThread("mDNS_Thread", mdns_thread,
