@@ -1,6 +1,7 @@
 // VitaCam - HTTP MJPEG IP Camera for PlayStation Vita
 // Supports dynamic resolution/FPS/camera toggles and battery saving black screen mode.
 
+#include <psp2/audioin.h>
 #include <psp2/camera.h>
 #include <psp2/ctrl.h>
 #include <psp2/display.h>
@@ -467,6 +468,7 @@ static void serve_html(int client) {
       "<p style=\"font-size: 16px; color: #888; margin-top: 0;\">Modo de Privacidade Ativo no PS Vita</p>"
       "</div>"
       "<img src=\"/stream\" onclick=\"this.style.objectFit = this.style.objectFit === 'cover' ? 'contain' : 'cover';\" title=\"Click to toggle Cover/Contain\">"
+      "<audio controls autoplay playsinline style=\"position:absolute;bottom:12px;left:12px;z-index:2;width:min(360px,90vw);opacity:.85\" src=\"/audio\"></audio>"
       "<script>"
       "function checkStatus() {"
       "  fetch('/status')"
@@ -498,8 +500,6 @@ static void serve_mjpeg(int client) {
 
   char chunk_hdr[128];
   while (1) {
-    handle_controls();
-
     if (g_webcam_off) {
       int w = g_res_widths[g_res_idx];
       int h = g_res_heights[g_res_idx];
@@ -536,6 +536,40 @@ static void serve_mjpeg(int client) {
     if (net_send_all(client, "\r\n", 2) < 0)
       break;
   }
+}
+
+/* Microphone stream: 16 kHz, mono, signed 16-bit PCM in a streaming WAV container. */
+static void serve_audio(int client) {
+  int16_t samples[256];
+  unsigned char wav[44];
+  int port = sceAudioInOpenPort(SCE_AUDIO_IN_PORT_TYPE_VOICE, 256, 16000, SCE_AUDIO_IN_PARAM_FORMAT_S16_MONO);
+  if (port < 0) {
+    const char *err = "HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\nMicrophone unavailable";
+    net_send_all(client, err, strlen(err));
+    return;
+  }
+  sceAudioInSelectInput(SCE_AUDIO_IN_INPUT_MODE_BUILTIN_MIC);
+  memset(wav, 0, sizeof(wav));
+  memcpy(wav, "RIFF", 4); wav[4]=0xFF; wav[5]=0xFF; wav[6]=0xFF; wav[7]=0x7F;
+  memcpy(wav+8, "WAVEfmt ", 8); wav[16]=16; wav[20]=1; wav[22]=1;
+  wav[24]=0x80; wav[25]=0x3E; wav[28]=0x00; wav[29]=0x7D;
+  wav[32]=2; wav[34]=16; memcpy(wav+36, "data", 4);
+  wav[40]=0xFF; wav[41]=0xFF; wav[42]=0xFF; wav[43]=0x7F;
+  const char *hdr = "HTTP/1.1 200 OK\r\nContent-Type: audio/wav\r\nTransfer-Encoding: chunked\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
+  if (net_send_all(client, hdr, strlen(hdr)) < 0 || net_send_all(client, wav, 44) < 0) { sceAudioInReleasePort(port); return; }
+  while (1) {
+    if (sceAudioInInput(port, samples) < 0) break;
+    char sizebuf[16]; int n = snprintf(sizebuf, sizeof(sizebuf), "%x\r\n", (int)sizeof(samples));
+    if (net_send_all(client, sizebuf, n) < 0 || net_send_all(client, samples, sizeof(samples)) < 0 || net_send_all(client, "\r\n", 2) < 0) break;
+  }
+  net_send_all(client, "0\r\n\r\n", 5);
+  sceAudioInReleasePort(port);
+}
+typedef struct { int client; int route; } ClientArgs;
+static int client_thread(SceSize args_size, void *argp) {
+  (void)args_size; ClientArgs *a=(ClientArgs *)argp; int client=a->client; int route=a->route; free(a);
+  if (route==1) serve_mjpeg(client); else if (route==2) serve_audio(client); else serve_html(client);
+  sceNetSocketClose(client); return sceKernelExitDeleteThread(0);
 }
 
 /* ── Main ──────────────────────────────────────────────────────── */
@@ -655,28 +689,17 @@ int main(void) {
 
     if (strstr(req_buf, "GET /status")) {
       char resp[128];
-      snprintf(resp, sizeof(resp),
-               "HTTP/1.1 200 OK\r\n"
-               "Content-Type: application/json\r\n"
-               "Access-Control-Allow-Origin: *\r\n"
-               "Connection: close\r\n\r\n"
-               "{\"webcam_off\":%d}", g_webcam_off);
+      snprintf(resp, sizeof(resp), "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n{\"webcam_off\":%d}", g_webcam_off);
       net_send_all(client, resp, strlen(resp));
+      sceNetSocketClose(client);
     } else {
-      psvDebugScreenPrintf("  [*] Client connected!\n");
-      psvDebugScreenPrintf("  [*] Request size: %d\n", total);
-
-      if (strstr(req_buf, "GET /stream")) {
-        psvDebugScreenPrintf("  [*] Serving MJPEG stream...\n");
-        serve_mjpeg(client);
-      } else {
-        psvDebugScreenPrintf("  [*] Serving HTML index...\n");
-        serve_html(client);
-      }
-      psvDebugScreenPrintf("  [*] Connection closed.\n");
+      int route = strstr(req_buf, "GET /stream") ? 1 : (strstr(req_buf, "GET /audio") ? 2 : 0);
+      ClientArgs *a = malloc(sizeof(ClientArgs));
+      if (!a) { sceNetSocketClose(client); continue; }
+      a->client = client; a->route = route;
+      SceUID thid = sceKernelCreateThread("HTTP_Client", client_thread, 0x10000100, 0x10000, 0, 0, NULL);
+      if (thid < 0 || sceKernelStartThread(thid, sizeof(ClientArgs), a) < 0) { free(a); sceNetSocketClose(client); }
     }
-
-    sceNetSocketClose(client);
   }
 
   return 0;
